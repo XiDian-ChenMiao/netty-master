@@ -147,10 +147,57 @@ Reactor多线程模型的特点如下：
 
 在绝大多数场景下，Reactor多线程模型可以满足性能需求。但是，在个别特殊场景中，一个NIO线程负责监听和处理所有的客户端连接可能会存在性能问题。例如并发百万客户端连接，或者服务端需要对客户端进行安全认证，但是认证本身非常损耗性能。在这种场景下，单独一个Acceptor线程可能会存在性能不足的问题，为了解决性能问题，产生了第三种Reactor线程模型——主从Reactor多线程模型。
 
-## Reactor多线程模型
+## 主从Reactor多线程模型
 
 ![主从线程模型](src/main/resources/images/reactor_ms_model.png)
 
 主从Reactor线程模型的特点是：服务端用于接收客户端连接的不再是一个单独的NIO线程，而是一个独立的NIO线程池。Acceptor接收到客户端TCP连接请求并处理完成后（可能包含接入认证等），将新创建的SocketChannel注册到IO线程池（sub reactor线程池）的某个IO线程上，由它负责SocketChannel的读写和编码工作。Acceptor线程池仅仅用于客户端的登录、握手和安全认证，一旦链路建立成功，就将链路注册到后端subReactor线程池的IO线程上，由IO线程负责后续的IO操作。
 
 利用主从NIO线程模型，可以解决一个服务端监听线程无法有效处理客户端连接的性能不足问题。因此，**在Netty的官方Demo中，推荐使用该线程模型**。
+
+## Netty的线程模型
+
+Netty的线程模型并不是一成不变的，它实际取决于用户的启动参数配置。通过设置不同的启动参数，Netty可以同时支持Reactor单线程模型、多线程模型和主从Reactor多线程模型。
+
+![Netty线程模型](src/main/resources/images/netty_t_model.png)
+
+可以通过如下代码来了解它的线程模型：
+
+```java
+EventLoopGroup bossGroup = new NioEventLoopGroup();
+EventLoopGroup workerGroup = new NioEventLoopGroup();
+ServerBootstrap b = new ServerBootstrap();
+b.group(bossGroup, workerGroup).channel(NioServerSocketChannel.class)
+.option(ChannelOption.SO_BACKLOG, 100)
+.handler(new LoggingHandler(LogLevel.INFO))
+.childHandler(new ChannelInitializer<SocketChannel>() {})
+```
+
+服务端启动的时候，创建了两个NioEventLoopGroup，它们实际是两个独立的Reactor线程池。一个用于接收客户端的TCP连接，另一个用于处理IO相关的读写操作，或者执行系统Task，定时任务Task等。
+
+Netty用于接收客户端请求的线程池职责如下：
+
+- 接收客户端TCP连接，初始化Channel参数；
+- 将链路状态变更时间通知给ChannelPipeline；
+
+Netty处理IO操作的Reactor线程池职责如下：
+
+- 异步读写通信对端的数据报，发送读事件到ChannelPipeline；
+- 异步发送消息通信对端，调用ChannelPipeline的消息发送接口；
+- 执行系统调用Task；
+- 执行定时任务Task，例如链路空闲状态监测定时任务。
+
+### 最佳实践
+
+Netty的多线程编程最佳实践如下：
+
+- 创建两个NioEventLoopGroup，用于逻辑隔离NIO Acceptor和NIO IO线程；
+- 尽量不要在ChannelHandler中启动用户线程（解码后用于将POJO消息派发到后端业务线程的除外）；
+- 解码要放在NIO线程调用的解码Handler中进行，不要切换到用户线程中完成消息的解码；
+- 如果业务逻辑操作非常简单，没有复杂的业务逻辑计算，没有可能会导致线程被阻塞的磁盘操作、数据库操作、网络操作等，可以直接在NIO线程上完成业务逻辑编写，不需要切换到用户线程；
+- 如果业务逻辑处理复杂，不要在NIO线程上完成，建议将编码后的POJO消息封装成Task，派发到业务线程池中由业务线程执行，以保证NIO线程尽快被释放，处理其他的IO操作。
+
+推荐的线程数量计算公式有以下两种：
+
+公式一：**线程数量=（线程总时间/瓶颈资源时间）×瓶颈资源的线程并行数**；
+公式二：**QPS=1000/线程总时间×线程数**
